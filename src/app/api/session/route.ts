@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { verifyToken, signToken } from "@/lib/jwt";
 
 type Accent = "american" | "british" | "australian" | "canadian" | "indian";
 
@@ -67,6 +68,8 @@ If the student spoke perfectly, skip the quick tip entirely. Do not force one.
 Accent and variety:
 `;
 
+const SESSION_DURATION_SECONDS = 900; // 15 minutes
+
 export async function POST(req: NextRequest) {
   if (!process.env.OPENAI_API_KEY) {
     return NextResponse.json(
@@ -76,8 +79,40 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json().catch(() => ({}));
+  const { paymentToken, sessionToken, accent: accentInput } = body;
+
+  let isNewSession = false;
+
+  if (sessionToken) {
+    try {
+      const payload = await verifyToken(sessionToken);
+      if (payload.type !== "session") throw new Error("Invalid token type");
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid or expired session token" },
+        { status: 401 }
+      );
+    }
+  } else if (paymentToken) {
+    try {
+      const payload = await verifyToken(paymentToken);
+      if (payload.type !== "payment") throw new Error("Invalid token type");
+      isNewSession = true;
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid or expired payment token" },
+        { status: 401 }
+      );
+    }
+  } else {
+    return NextResponse.json(
+      { error: "Authentication required" },
+      { status: 401 }
+    );
+  }
+
   const accent: Accent =
-    body.accent in ACCENT_CONFIG ? (body.accent as Accent) : "american";
+    accentInput in ACCENT_CONFIG ? (accentInput as Accent) : "american";
 
   const { voice, instruction } = ACCENT_CONFIG[accent];
   const systemPrompt =
@@ -111,5 +146,13 @@ export async function POST(req: NextRequest) {
   }
 
   const data = await res.json();
-  return NextResponse.json({ token: data.client_secret.value });
+  const response: Record<string, unknown> = { token: data.client_secret.value };
+
+  if (isNewSession) {
+    const sessionExp = Math.floor(Date.now() / 1000) + SESSION_DURATION_SECONDS;
+    response.sessionToken = await signToken({ type: "session" }, sessionExp);
+    response.sessionExp = sessionExp;
+  }
+
+  return NextResponse.json(response);
 }

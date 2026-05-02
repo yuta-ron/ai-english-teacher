@@ -17,10 +17,23 @@ interface UseRealtimeSessionReturn {
   isPaused: boolean;
   messages: Message[];
   amplitude: number;
-  connect: (accent?: string) => Promise<void>;
+  remainingSeconds: number;
+  connect: (accent?: string, paymentToken?: string) => Promise<void>;
   disconnect: () => void;
   pause: () => void;
   resume: () => void;
+}
+
+const SESSION_TOKEN_KEY = "ai_session_token";
+const SESSION_EXP_KEY = "ai_session_exp";
+
+function parseJwtExp(token: string): number {
+  try {
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    return (JSON.parse(atob(b64)) as { exp: number }).exp;
+  } catch {
+    return 0;
+  }
 }
 
 export function useRealtimeSession(): UseRealtimeSessionReturn {
@@ -28,6 +41,8 @@ export function useRealtimeSession(): UseRealtimeSessionReturn {
   const [isPaused, setIsPaused] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [amplitude, setAmplitude] = useState(0);
+  const [remainingSeconds, setRemainingSeconds] = useState(0);
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
@@ -37,15 +52,53 @@ export function useRealtimeSession(): UseRealtimeSessionReturn {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const isPausedRef = useRef(false);
-  // Ref mirrors status so disconnect→connect can run in the same call stack
   const statusRef = useRef<SessionStatus>("idle");
-  // True after response.audio.done — we wait for actual silence before unmuting
   const waitingToUnmuteRef = useRef(false);
+  const sessionTokenRef = useRef<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const updateStatus = useCallback((s: SessionStatus) => {
     statusRef.current = s;
     setStatus(s);
   }, []);
+
+  const stopTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  const startTimer = useCallback(
+    (exp: number) => {
+      stopTimer();
+      timerRef.current = setInterval(() => {
+        const remaining = exp - Math.floor(Date.now() / 1000);
+        if (remaining <= 0) {
+          setRemainingSeconds(0);
+          stopTimer();
+          setSessionExpired(true);
+          localStorage.removeItem(SESSION_TOKEN_KEY);
+          localStorage.removeItem(SESSION_EXP_KEY);
+          sessionTokenRef.current = null;
+        } else {
+          setRemainingSeconds(remaining);
+        }
+      }, 500);
+    },
+    [stopTimer]
+  );
+
+  // Load session token from localStorage on init
+  useEffect(() => {
+    const stored = localStorage.getItem(SESSION_TOKEN_KEY);
+    const exp = Number(localStorage.getItem(SESSION_EXP_KEY) || 0);
+    if (stored && exp > Math.floor(Date.now() / 1000)) {
+      sessionTokenRef.current = stored;
+      setRemainingSeconds(exp - Math.floor(Date.now() / 1000));
+      startTimer(exp);
+    }
+  }, [startTimer]);
 
   const stopAmplitudeLoop = useCallback(() => {
     if (rafRef.current !== null) {
@@ -68,7 +121,6 @@ export function useRealtimeSession(): UseRealtimeSessionReturn {
       const amp = max / 128;
       setAmplitude(amp);
 
-      // Unmute mic only after AI audio has actually gone silent in the browser
       if (waitingToUnmuteRef.current && amp < 0.03) {
         waitingToUnmuteRef.current = false;
         if (!isPausedRef.current) {
@@ -83,87 +135,88 @@ export function useRealtimeSession(): UseRealtimeSessionReturn {
     rafRef.current = requestAnimationFrame(tick);
   }, []);
 
-  const handleEvent = useCallback((raw: string) => {
-    let event: Record<string, unknown>;
-    try {
-      event = JSON.parse(raw);
-    } catch {
-      return;
-    }
-
-    switch (event.type) {
-      case "session.created":
-        updateStatus("listening");
-        break;
-
-      case "input_audio_buffer.speech_started":
-        updateStatus("listening");
-        break;
-
-      case "response.audio.started":
-        localStreamRef.current?.getAudioTracks().forEach((t) => {
-          t.enabled = false;
-        });
-        updateStatus("speaking");
-        break;
-
-      case "response.audio.done":
-        // Don't unmute immediately — browser buffer still has audio playing.
-        // The amplitude loop detects actual silence and then unmutes.
-        waitingToUnmuteRef.current = true;
-        updateStatus("listening");
-        break;
-
-      case "conversation.item.input_audio_transcription.completed": {
-        const transcript = event.transcript as string;
-        if (!transcript?.trim()) break;
-        setMessages((prev) => [
-          ...prev,
-          { id: crypto.randomUUID(), role: "user", text: transcript.trim() },
-        ]);
-        break;
+  const handleEvent = useCallback(
+    (raw: string) => {
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(raw);
+      } catch {
+        return;
       }
 
-      case "response.audio_transcript.done": {
-        const transcript = event.transcript as string;
-        if (!transcript?.trim()) break;
+      switch (event.type) {
+        case "session.created":
+          updateStatus("listening");
+          break;
 
-        const correctionMatch = transcript.match(
-          /[Qq]uick tip[:\s]+[""]?(.+?)[""]?(?:\.|$)/
-        );
-        const correction = correctionMatch
-          ? correctionMatch[1].trim()
-          : undefined;
+        case "input_audio_buffer.speech_started":
+          updateStatus("listening");
+          break;
 
-        const cleanText = transcript
-          .replace(/[Qq]uick tip[:\s]+[""]?.+?[""]?\.?\s*$/, "")
-          .trim();
+        case "response.audio.started":
+          localStreamRef.current?.getAudioTracks().forEach((t) => {
+            t.enabled = false;
+          });
+          updateStatus("speaking");
+          break;
 
-        const id = crypto.randomUUID();
-        setMessages((prev) => [
-          ...prev,
-          { id, role: "assistant", text: cleanText, correction },
-        ]);
+        case "response.audio.done":
+          waitingToUnmuteRef.current = true;
+          updateStatus("listening");
+          break;
 
-        fetch("/api/translate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: cleanText }),
-        })
-          .then((r) => r.json())
-          .then(({ translation }: { translation: string }) => {
-            if (translation) {
-              setMessages((prev) =>
-                prev.map((m) => (m.id === id ? { ...m, translation } : m))
-              );
-            }
+        case "conversation.item.input_audio_transcription.completed": {
+          const transcript = event.transcript as string;
+          if (!transcript?.trim()) break;
+          setMessages((prev) => [
+            ...prev,
+            { id: crypto.randomUUID(), role: "user", text: transcript.trim() },
+          ]);
+          break;
+        }
+
+        case "response.audio_transcript.done": {
+          const transcript = event.transcript as string;
+          if (!transcript?.trim()) break;
+
+          const correctionMatch = transcript.match(
+            /[Qq]uick tip[:\s]+[""]?(.+?)[""]?(?:\.|$)/
+          );
+          const correction = correctionMatch
+            ? correctionMatch[1].trim()
+            : undefined;
+
+          const cleanText = transcript
+            .replace(/[Qq]uick tip[:\s]+[""]?.+?[""]?\.?\s*$/, "")
+            .trim();
+
+          const id = crypto.randomUUID();
+          setMessages((prev) => [
+            ...prev,
+            { id, role: "assistant", text: cleanText, correction },
+          ]);
+
+          fetch("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: cleanText }),
           })
-          .catch(() => {});
+            .then((r) => r.json())
+            .then(({ translation }: { translation: string }) => {
+              if (translation) {
+                setMessages((prev) =>
+                  prev.map((m) => (m.id === id ? { ...m, translation } : m))
+                );
+              }
+            })
+            .catch(() => {});
 
-        break;
+          break;
+        }
       }
-    }
-  }, [updateStatus]);
+    },
+    [updateStatus]
+  );
 
   const pause = useCallback(() => {
     isPausedRef.current = true;
@@ -202,79 +255,121 @@ export function useRealtimeSession(): UseRealtimeSessionReturn {
     setAmplitude(0);
   }, [stopAmplitudeLoop, updateStatus]);
 
-  const connect = useCallback(async (accent = "american") => {
-    // Use ref so this works even right after disconnect() in the same call stack
-    if (statusRef.current !== "idle") return;
-    updateStatus("connecting");
+  // Handle session expiry (triggered from timer)
+  useEffect(() => {
+    if (sessionExpired) {
+      disconnect();
+      setSessionExpired(false);
+    }
+  }, [sessionExpired, disconnect]);
 
-    try {
-      const res = await fetch("/api/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accent }),
-      });
-      if (!res.ok) throw new Error("Failed to get session token");
-      const { token } = await res.json();
+  const connect = useCallback(
+    async (accent = "american", paymentToken?: string) => {
+      if (statusRef.current !== "idle") return;
+      updateStatus("connecting");
 
-      const pc = new RTCPeerConnection();
-      pcRef.current = pc;
-
-      if (!audioRef.current) {
-        audioRef.current = new Audio();
-        audioRef.current.autoplay = true;
+      const body: Record<string, string> = { accent };
+      if (paymentToken) {
+        body.paymentToken = paymentToken;
+      } else if (sessionTokenRef.current) {
+        body.sessionToken = sessionTokenRef.current;
+      } else {
+        updateStatus("idle");
+        return;
       }
 
-      pc.ontrack = (e) => {
-        const stream = e.streams[0];
-        audioRef.current!.srcObject = stream;
-
-        const ctx = new AudioContext();
-        audioCtxRef.current = ctx;
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        analyserRef.current = analyser;
-        startAmplitudeLoop();
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localStreamRef.current = stream;
-      stream.getAudioTracks().forEach((track) => pc.addTrack(track, stream));
-
-      const dc = pc.createDataChannel("oai-events");
-      dcRef.current = dc;
-      dc.onmessage = (e) => handleEvent(e.data);
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      const sdpRes = await fetch(
-        `https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
-        {
+      try {
+        const res = await fetch("/api/session", {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/sdp",
-          },
-          body: offer.sdp,
-        }
-      );
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error("Failed to get session token");
+        const data = await res.json();
+        const { token, sessionToken: newSessionToken, sessionExp } = data;
 
-      if (!sdpRes.ok) throw new Error("Failed to connect to OpenAI Realtime");
-      const answerSdp = await sdpRes.text();
-      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-    } catch (err) {
-      console.error(err);
-      disconnect();
-    }
-  }, [handleEvent, startAmplitudeLoop, disconnect, updateStatus]);
+        if (newSessionToken && sessionExp) {
+          sessionTokenRef.current = newSessionToken;
+          localStorage.setItem(SESSION_TOKEN_KEY, newSessionToken);
+          localStorage.setItem(SESSION_EXP_KEY, String(sessionExp));
+          setRemainingSeconds(sessionExp - Math.floor(Date.now() / 1000));
+          startTimer(sessionExp);
+        }
+
+        const pc = new RTCPeerConnection();
+        pcRef.current = pc;
+
+        if (!audioRef.current) {
+          audioRef.current = new Audio();
+          audioRef.current.autoplay = true;
+        }
+
+        pc.ontrack = (e) => {
+          const stream = e.streams[0];
+          audioRef.current!.srcObject = stream;
+
+          const ctx = new AudioContext();
+          audioCtxRef.current = ctx;
+          const source = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+          analyserRef.current = analyser;
+          startAmplitudeLoop();
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        localStreamRef.current = stream;
+        stream.getAudioTracks().forEach((track) => pc.addTrack(track, stream));
+
+        const dc = pc.createDataChannel("oai-events");
+        dcRef.current = dc;
+        dc.onmessage = (e) => handleEvent(e.data);
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const sdpRes = await fetch(
+          `https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/sdp",
+            },
+            body: offer.sdp,
+          }
+        );
+
+        if (!sdpRes.ok) throw new Error("Failed to connect to OpenAI Realtime");
+        const answerSdp = await sdpRes.text();
+        await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      } catch (err) {
+        console.error(err);
+        disconnect();
+      }
+    },
+    [handleEvent, startAmplitudeLoop, disconnect, updateStatus, startTimer]
+  );
 
   useEffect(() => {
     return () => {
       stopAmplitudeLoop();
+      stopTimer();
     };
-  }, [stopAmplitudeLoop]);
+  }, [stopAmplitudeLoop, stopTimer]);
 
-  return { status, isPaused, messages, amplitude, connect, disconnect, pause, resume };
+  return {
+    status,
+    isPaused,
+    messages,
+    amplitude,
+    remainingSeconds,
+    connect,
+    disconnect,
+    pause,
+    resume,
+  };
 }
+
+export { parseJwtExp };

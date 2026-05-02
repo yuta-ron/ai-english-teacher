@@ -5,30 +5,105 @@ import { Avatar } from "@/components/Avatar";
 import { ConversationLog } from "@/components/ConversationLog";
 import { StatusIndicator } from "@/components/StatusIndicator";
 import { AccentSelector, type Accent } from "@/components/AccentSelector";
-import { useRealtimeSession } from "@/hooks/useRealtimeSession";
+import { useRealtimeSession, parseJwtExp } from "@/hooks/useRealtimeSession";
+
+type PaymentState = "loading" | "no-token" | "ready" | "in-session" | "expired";
+
+const PAYMENT_TOKEN_KEY = "ai_payment_token";
+const SESSION_TOKEN_KEY = "ai_session_token";
+const SESSION_EXP_KEY = "ai_session_exp";
+
+function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
 
 export default function Home() {
-  const { status, isPaused, messages, amplitude, connect, disconnect, pause, resume } =
-    useRealtimeSession();
+  const {
+    status,
+    isPaused,
+    messages,
+    amplitude,
+    remainingSeconds,
+    connect,
+    disconnect,
+    pause,
+    resume,
+  } = useRealtimeSession();
 
   const [accent, setAccent] = useState<Accent>("american");
+  const [paymentState, setPaymentState] = useState<PaymentState>("loading");
+  const [isPurchasing, setIsPurchasing] = useState(false);
 
+  // Initialize: check URL token and localStorage
   useEffect(() => {
-    connect(accent);
-    return () => disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const url = new URL(window.location.href);
+    const urlToken = url.searchParams.get("token");
+    if (urlToken) {
+      localStorage.setItem(PAYMENT_TOKEN_KEY, urlToken);
+      url.searchParams.delete("token");
+      window.history.replaceState({}, "", url.toString());
+    }
+
+    const sessionExp = Number(localStorage.getItem(SESSION_EXP_KEY) || 0);
+    const sessionToken = localStorage.getItem(SESSION_TOKEN_KEY);
+
+    if (sessionToken && sessionExp > Math.floor(Date.now() / 1000)) {
+      setPaymentState("ready");
+      return;
+    }
+
+    const paymentToken = localStorage.getItem(PAYMENT_TOKEN_KEY);
+    if (paymentToken && parseJwtExp(paymentToken) > Math.floor(Date.now() / 1000)) {
+      setPaymentState("ready");
+      return;
+    }
+
+    setPaymentState("no-token");
   }, []);
+
+  // Sync paymentState with session status
+  useEffect(() => {
+    if (status === "listening" || status === "speaking") {
+      setPaymentState("in-session");
+    }
+  }, [status]);
+
+  // Detect session expiry (remainingSeconds hits 0 while in session)
+  useEffect(() => {
+    if (remainingSeconds === 0 && paymentState === "in-session") {
+      setPaymentState("expired");
+    }
+  }, [remainingSeconds, paymentState]);
+
+  const handlePurchase = async () => {
+    setIsPurchasing(true);
+    try {
+      const res = await fetch("/api/stripe/checkout", { method: "POST" });
+      const { url } = await res.json();
+      if (url) window.location.href = url;
+    } catch {
+      setIsPurchasing(false);
+    }
+  };
+
+  const handleStartSession = async () => {
+    const paymentToken = localStorage.getItem(PAYMENT_TOKEN_KEY) ?? undefined;
+    await connect(accent, paymentToken);
+  };
 
   const handleAccentChange = (newAccent: Accent) => {
     setAccent(newAccent);
-    // Reconnect with new accent: disconnect resets statusRef synchronously,
-    // so connect() can run immediately after in the same call stack.
-    disconnect();
-    connect(newAccent);
+    if (status !== "idle" && status !== "connecting") {
+      disconnect();
+      connect(newAccent);
+    }
   };
 
   const canPause = status === "listening" || status === "speaking";
   const isActive = status !== "idle" && status !== "connecting";
+  const isSessionActive = paymentState === "in-session";
 
   return (
     <main className="min-h-screen bg-slate-900 flex flex-col items-center justify-start py-6 px-4">
@@ -41,6 +116,11 @@ export default function Home() {
           <p className="text-slate-400 text-sm mt-1">
             いつでも気軽に英会話の練習を
           </p>
+          {isSessionActive && remainingSeconds > 0 && (
+            <div className={`mt-2 text-sm font-mono font-semibold tabular-nums ${remainingSeconds <= 60 ? "text-red-400" : "text-amber-400"}`}>
+              残り {formatTime(remainingSeconds)}
+            </div>
+          )}
         </div>
 
         {/* Main content: side-by-side on PC, stacked on mobile */}
@@ -76,9 +156,42 @@ export default function Home() {
               <AccentSelector
                 value={accent}
                 onChange={handleAccentChange}
-                disabled={status === "connecting"}
+                disabled={status === "connecting" || paymentState === "no-token" || paymentState === "loading"}
               />
             </div>
+
+            {/* Payment / session controls */}
+            {(paymentState === "no-token" || paymentState === "expired") && (
+              <button
+                onClick={handlePurchase}
+                disabled={isPurchasing}
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-2xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-600 disabled:text-slate-400 text-white transition-colors"
+              >
+                {isPurchasing ? (
+                  "処理中..."
+                ) : (
+                  <>
+                    <span>¥100</span>
+                    <span className="text-indigo-200">で15分のセッションを購入</span>
+                  </>
+                )}
+              </button>
+            )}
+
+            {paymentState === "ready" && (
+              <button
+                onClick={handleStartSession}
+                disabled={status === "connecting"}
+                className="w-full flex flex-col items-center gap-1 px-4 py-3 rounded-2xl text-sm font-semibold bg-green-600 hover:bg-green-500 disabled:bg-slate-600 disabled:text-slate-400 text-white transition-colors"
+              >
+                <span>{status === "connecting" ? "接続中..." : "セッションを開始"}</span>
+                {remainingSeconds > 0 && (
+                  <span className="text-xs text-green-200 font-mono">
+                    残り {formatTime(remainingSeconds)}
+                  </span>
+                )}
+              </button>
+            )}
 
             {/* Pause / Resume button */}
             {canPause && (
@@ -132,7 +245,9 @@ export default function Home() {
 
         {/* Tips */}
         <div className="text-center text-slate-500 text-xs leading-relaxed">
-          英語で自由に話しかけてください。文法ミスは Alex が優しく訂正します。
+          {paymentState === "no-token" || paymentState === "expired"
+            ? "¥100で15分間、AIと英会話の練習ができます。"
+            : "英語で自由に話しかけてください。文法ミスは Alex が優しく訂正します。"}
         </div>
       </div>
     </main>
