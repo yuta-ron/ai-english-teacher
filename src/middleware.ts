@@ -4,7 +4,9 @@ export function middleware(req: NextRequest) {
   const user = process.env.BASIC_AUTH_USER;
   const pass = process.env.BASIC_AUTH_PASSWORD;
 
-  if (!user || !pass) return NextResponse.next();
+  if (process.env.BASIC_AUTH_ENABLED !== "true" || !user || !pass) {
+    return NextResponse.next();
+  }
 
   const authorization = req.headers.get("authorization");
   if (authorization) {
