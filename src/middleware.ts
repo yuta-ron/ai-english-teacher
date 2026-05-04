@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export function middleware(req: NextRequest) {
-  if (process.env.BASIC_AUTH_ENABLED !== "true") return NextResponse.next();
+  if (process.env.BASIC_AUTH_ENABLED === "false") return NextResponse.next();
 
   const user = process.env.BASIC_AUTH_USER;
   const pass = process.env.BASIC_AUTH_PASSWORD;
