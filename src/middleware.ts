@@ -1,11 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export function middleware(req: NextRequest) {
+  if (process.env.BASIC_AUTH_ENABLED !== "true") return NextResponse.next();
+
   const user = process.env.BASIC_AUTH_USER;
   const pass = process.env.BASIC_AUTH_PASSWORD;
 
-  if (process.env.BASIC_AUTH_ENABLED !== "true" || !user || !pass) {
-    return NextResponse.next();
+  if (!user || !pass) {
+    return new NextResponse("Basic Auth misconfigured: credentials not set", {
+      status: 500,
+    });
   }
 
   const authorization = req.headers.get("authorization");
